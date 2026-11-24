@@ -1,0 +1,263 @@
+---
+title: "Tail-Index Diagnostics for PDX C0331-231"
+subtitle: "Figures for Chapter 4"
+author: "Horty Katé Nango"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    number_sections: true
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 5, fig.align = "center")
+```
+
+# Diagnostics and figures
+
+```{r diagnostics}
+## =============================================================================
+## tail_index_diagnostics_C0331.R
+##
+## Adapted from tail_index_diagnostics.R. The same diagnostics are applied to
+## the OBSERVED clone sizes of PDX C0331-231 instead of synthetic data, and the
+## plots are saved as PDF figures for Chapter 4 of the thesis:
+##
+##   ch4_pareto_tail.pdf   -> Section 4.3.2 (empirical Pareto-tail plots)
+##   ch4_hill_plot.pdf     -> Section 4.4   (Hill re-examination)
+##   ch4_obrien.pdf        -> Section 4.4   (O'Brien maximum-to-sum diagnostic)
+##   ch4_running_mean.pdf  -> Section 4.5   (running means)
+##
+## The settings follow the main analysis (16.Rmd): controls excluded, dAMSE from
+## the R package tea, O'Brien with 40 permutations and 60 sample sizes from 50
+## to n, slope cutoff -0.1, seed = 1244 + sgRNA index.
+##
+## HOW TO RUN: put this script in the same folder as C0331-231.csv and
+## signaling1_guides.csv (the folder of 16.Rmd), then source it in RStudio.
+## =============================================================================
+
+library(tea)   # dAMSE threshold selection, as in the main analysis
+
+## -----------------------------------------------------------------------
+## 0. SETTINGS
+## -----------------------------------------------------------------------
+data_file      <- "C0331-231.csv"          # positive clone counts
+map_file       <- "signaling1_guides.csv"  # sgRNA index -> official name
+target_pdx     <- "C0331-231"
+example_sgrnas <- c("MYC_2", "ILK_3")      # a third example is chosen below
+base_seed      <- 1244                     # same as 16.Rmd
+obrien_cutoff  <- -0.1                     # slope below -0.1 = clearly decaying
+fig_dir        <- "figures_thesis"
+dir.create(fig_dir, showWarnings = FALSE)
+
+## -----------------------------------------------------------------------
+## 1. DATA: positive counts of the gene-targeting sgRNAs of C0331-231
+## -----------------------------------------------------------------------
+raw <- read.csv(data_file, stringsAsFactors = FALSE, check.names = FALSE)
+if ("dataset" %in% names(raw)) raw <- raw[trimws(raw$dataset) == target_pdx, ]
+raw$M <- suppressWarnings(as.numeric(raw$M))
+raw <- raw[is.finite(raw$M) & raw$M > 0, ]
+raw <- raw[tolower(trimws(raw$gene)) != "ctl", ]   # control guides excluded
+
+map <- read.csv(map_file, stringsAsFactors = FALSE)
+raw$sgRNA_index    <- as.integer(raw$sgRNA)
+raw$sgRNA_official <- trimws(map$name[match(raw$sgRNA_index, as.integer(map$sgRNA))])
+if (anyNA(raw$sgRNA_official)) stop("Some sgRNAs have no official name in the map file.")
+
+samples  <- split(raw$M, raw$sgRNA_official)
+index_of <- tapply(raw$sgRNA_index, raw$sgRNA_official, function(v) v[1])
+cat("Gene-targeting sgRNAs:", length(samples), "\n")
+
+## -----------------------------------------------------------------------
+## 2. FUNCTIONS (from tail_index_diagnostics.R)
+## -----------------------------------------------------------------------
+hill_est <- function(x, k) {
+  xs <- sort(abs(x), decreasing = TRUE)
+  if (k >= length(xs)) stop("k must be smaller than sample size")
+  kappa_hat <- 1 / (mean(log(xs[1:k])) - log(xs[k + 1]))
+  se <- kappa_hat / sqrt(k)
+  c(kappa_hat = kappa_hat, se = se,
+    lower = kappa_hat - 1.96 * se, upper = kappa_hat + 1.96 * se)
+}
+
+## Hill estimate for every k from 15 to 35% of the sample (grid of 16.Rmd)
+hill_curve <- function(x) {
+  k <- 15:floor(0.35 * length(x))
+  data.frame(k = k, kappa_hat = sapply(k, function(kk) hill_est(x, kk)["kappa_hat"]))
+}
+
+running_moment <- function(x, q) cumsum(abs(x)^q) / seq_along(x)
+
+obrien_slope <- function(x, n_points = 60, n_perm = 40) {
+  n <- length(x)
+  idx <- unique(round(exp(seq(log(50), log(n), length.out = n_points))))
+  logratio_mat <- matrix(NA_real_, n_perm, length(idx))
+  for (p in 1:n_perm) {
+    xp <- sample(x)                 # random permutation = another valid path
+    cs <- cumsum(abs(xp))
+    cm <- cummax(abs(xp))
+    logratio_mat[p, ] <- log(cm[idx] / cs[idx])
+  }
+  avg_logratio <- colMeans(logratio_mat)
+  fit <- lm(avg_logratio ~ log(idx))
+  list(slope = unname(coef(fit)[2]), avg_logratio = avg_logratio, idx = idx)
+}
+
+## dAMSE from the tea package (same call as in 16.Rmd)
+damse_fit <- function(x) {
+  out <- c(alpha = NA_real_, k = NA_real_, threshold = NA_real_)
+  if (length(x) < 50 || length(unique(x)) < 5) return(out)
+  fit <- tryCatch(suppressWarnings(tea::dAMSE(x)), error = function(e) NULL)
+  if (is.null(fit)) return(out)
+  c(alpha = as.numeric(fit$tail.index)[1], k = as.numeric(fit$k0)[1],
+    threshold = as.numeric(fit$threshold)[1])
+}
+
+## -----------------------------------------------------------------------
+## 3. DIAGNOSTICS FOR ALL sgRNAs (needed to choose the third example)
+## -----------------------------------------------------------------------
+diag <- do.call(rbind, lapply(names(samples), function(g) {
+  x <- samples[[g]]
+  d <- damse_fit(x)
+  set.seed(base_seed + index_of[[g]])          # same seed as 16.Rmd
+  ob <- obrien_slope(x)
+  data.frame(sgRNA = g, n = length(x), alpha_damse = d["alpha"],
+             k_damse = d["k"], threshold = d["threshold"],
+             alpha_lower = d["alpha"] - 1.645 * d["alpha"] / sqrt(d["k"]),
+             obrien_slope = ob$slope, row.names = NULL)
+}))
+diag$obrien_decaying <- diag$obrien_slope < obrien_cutoff
+
+## Third example: dAMSE alpha <= 1 AND O'Brien not decaying (both suggest
+## that the mean may not exist); among those, the sgRNA with most observations.
+both_negative <- diag[is.finite(diag$alpha_damse) & diag$alpha_damse <= 1 &
+                        !diag$obrien_decaying, ]
+third <- if (nrow(both_negative)) both_negative$sgRNA[which.max(both_negative$n)] else
+  diag$sgRNA[which.min(diag$alpha_damse)]
+examples <- c(example_sgrnas, third)
+if (any(!examples %in% names(samples))) stop("Example sgRNA not found: ",
+  paste(examples[!examples %in% names(samples)], collapse = ", "))
+
+cat("\nExamples used in the figures:\n")
+print(diag[match(examples, diag$sgRNA), ], digits = 3)
+write.csv(diag, file.path(fig_dir, "ch4_diagnostics_all_sgRNAs.csv"), row.names = FALSE)
+
+colors <- c("#1b9e77", "#d95f02", "#7570b3")
+names(colors) <- examples
+ex <- diag[match(examples, diag$sgRNA), ]
+labels <- sprintf("%s (n = %d, dAMSE alpha = %.2f)", ex$sgRNA, ex$n, ex$alpha_damse)
+names(labels) <- examples
+
+## -----------------------------------------------------------------------
+## 4. FIGURE 1: EMPIRICAL PARETO-TAIL PLOTS (Section 4.3.2)
+## Points: empirical survival P(M > x) on log-log axes.
+## Dashed line: Pareto tail with slope -alpha_hat (dAMSE), from the threshold.
+## -----------------------------------------------------------------------
+surv <- lapply(examples, function(g) {
+  x <- samples[[g]]; ux <- sort(unique(x)); s <- 1 - ecdf(x)(ux)
+  data.frame(x = ux[s > 0], s = s[s > 0])
+})
+names(surv) <- examples
+
+pdf(file.path(fig_dir, "ch4_pareto_tail.pdf"), width = 7, height = 5)
+plot(NA, log = "xy",
+     xlim = range(unlist(lapply(surv, `[[`, "x"))),
+     ylim = range(unlist(lapply(surv, `[[`, "s"))),
+     xlab = "Clone size x (log scale)", ylab = "Empirical P(M > x) (log scale)",
+     main = "Empirical Pareto-tail plots, PDX C0331-231")
+for (g in examples) {
+  points(surv[[g]]$x, surv[[g]]$s, col = colors[g], pch = 16, cex = 0.6)
+  x <- samples[[g]]; u <- ex$threshold[ex$sgRNA == g]; a <- ex$alpha_damse[ex$sgRNA == g]
+  su <- mean(x > u)
+  if (is.finite(u) && is.finite(a) && su > 0) {
+    xs <- exp(seq(log(u), log(max(x)), length.out = 50))
+    lines(xs, su * (xs / u)^(-a), col = colors[g], lwd = 2, lty = 2)
+  }
+}
+legend("bottomleft", legend = labels, col = colors, pch = 16, lty = 2, lwd = 2,
+       bty = "n", cex = 0.8)
+dev.off()
+
+## -----------------------------------------------------------------------
+## 5. FIGURE 2: HILL PLOTS (Section 4.4, re-examination)
+## Hill estimate as a function of k; the dotted line marks alpha = 1.
+## -----------------------------------------------------------------------
+hill <- lapply(examples, function(g) hill_curve(samples[[g]]))
+names(hill) <- examples
+
+pdf(file.path(fig_dir, "ch4_hill_plot.pdf"), width = 7, height = 5)
+plot(NA, log = "x",
+     xlim = range(unlist(lapply(hill, `[[`, "k"))),
+     ylim = range(c(0.5, unlist(lapply(hill, `[[`, "kappa_hat"))), finite = TRUE),
+     xlab = "Number of upper order statistics k (log scale)",
+     ylab = expression(hat(alpha)[H](k)),
+     main = "Hill plots, PDX C0331-231")
+abline(h = 1, lty = 3, col = "grey40")
+for (g in examples) lines(hill[[g]]$k, hill[[g]]$kappa_hat, col = colors[g], lwd = 2)
+legend("topright", legend = labels, col = colors, lwd = 2, bty = "n", cex = 0.8)
+dev.off()
+
+## -----------------------------------------------------------------------
+## 6. FIGURE 3: O'BRIEN MAXIMUM-TO-SUM DIAGNOSTIC (Section 4.4)
+## Downward-sloping line = mean exists; flat line = mean does not exist.
+## -----------------------------------------------------------------------
+ob <- lapply(examples, function(g) {
+  set.seed(base_seed + index_of[[g]])          # same paths as in 16.Rmd
+  obrien_slope(samples[[g]])
+})
+names(ob) <- examples
+
+pdf(file.path(fig_dir, "ch4_obrien.pdf"), width = 7, height = 5)
+xr <- range(unlist(lapply(ob, `[[`, "idx")))
+yr <- range(unlist(lapply(ob, `[[`, "avg_logratio")))
+plot(NA, xlim = log(xr), ylim = yr, xaxt = "n",
+     xlab = "Number of observations n (log scale)",
+     ylab = expression(log(M[n] / S[n]) ~ "(permutation-averaged)"),
+     main = "O'Brien maximum-to-sum diagnostic, PDX C0331-231")
+axis(1, at = pretty(log(xr)), labels = round(exp(pretty(log(xr)))))
+for (g in examples) lines(log(ob[[g]]$idx), ob[[g]]$avg_logratio, col = colors[g], lwd = 2)
+legend("bottomleft",
+       legend = paste0(examples, sprintf("  [slope = %.3f]", sapply(ob, `[[`, "slope"))),
+       col = colors, lwd = 2, bty = "n", cex = 0.8)
+dev.off()
+
+## -----------------------------------------------------------------------
+## 7. FIGURE 4: RUNNING MEANS (Section 4.5)
+## Each running mean is divided by its final value: flat near 1 = stabilized
+## (mean exists); jumps or drift = sensitive to extreme observations.
+## One random order of the observations per sgRNA (reproducible seed).
+## -----------------------------------------------------------------------
+rm_curves <- lapply(examples, function(g) {
+  set.seed(base_seed + 5479 + index_of[[g]])
+  r <- running_moment(sample(samples[[g]]), 1)
+  r / r[length(r)]
+})
+names(rm_curves) <- examples
+
+pdf(file.path(fig_dir, "ch4_running_mean.pdf"), width = 7, height = 5)
+plot(NA, xlim = c(1, max(lengths(rm_curves))), ylim = range(unlist(rm_curves)),
+     xlab = "Number of observations n",
+     ylab = expression(hat(m)[1](n) / hat(m)[1](n[max])),
+     main = "Running sample means (normalized), PDX C0331-231")
+abline(h = 1, lty = 2, col = "grey60")
+for (g in examples) lines(seq_along(rm_curves[[g]]), rm_curves[[g]], col = colors[g], lwd = 2)
+legend("topright", legend = examples, col = colors, lwd = 2, bty = "o", bg = "white", cex = 0.8)
+dev.off()
+
+cat("\nSaved in", fig_dir, ":\n",
+    " ch4_pareto_tail.pdf, ch4_hill_plot.pdf, ch4_obrien.pdf, ch4_running_mean.pdf,\n",
+    " ch4_diagnostics_all_sgRNAs.csv\n")
+```
+
+# Figures for the thesis
+
+```{r show-figures, echo=FALSE, out.width="90%"}
+knitr::include_graphics(file.path("figures_thesis", c(
+  "ch4_pareto_tail.pdf",
+  "ch4_hill_plot.pdf",
+  "ch4_obrien.pdf",
+  "ch4_running_mean.pdf"
+)))
+```
