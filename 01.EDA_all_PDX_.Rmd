@@ -1,0 +1,460 @@
+---
+title: "Global Exploratory Data Analysis of the CRISPR-PDX Datasets"
+author: "Horty Katé"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+documentclass: extarticle
+output:
+  pdf_document:
+    latex_engine: xelatex
+    number_sections: false
+fontsize: 9pt
+geometry: margin=1.25cm
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{float}
+  - \usepackage{titlesec}
+  - \titlespacing*{\section}{0pt}{0.6em}{0.25em}
+  - \setlength{\parindent}{0pt}
+  - \setlength{\parskip}{2pt}
+  - \setlength{\tabcolsep}{4pt}
+  - \renewcommand{\arraystretch}{0.92}
+---
+
+```{r setup, include=FALSE}
+# Install once if necessary:
+# install.packages(c("data.table", "knitr", "rmarkdown"))
+
+library(data.table)
+library(knitr)
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+
+# -----------------------------------------------------------------------------
+# 1. Locate the folder containing the PDX CSV files
+# -----------------------------------------------------------------------------
+# The folder containing the largest number of CSV files is selected.
+# If necessary, add your own folder to candidate_dirs.
+candidate_dirs <- c(
+  file.path(
+    "/cloud/project", "Bachelorthesis", "Literatur",
+    "data_for_Eirew_et_al_2022", "countFiles", "final"
+  ),
+  file.path(
+    "Bachelorthesis", "Literatur", "data_for_Eirew_et_al_2022",
+    "countFiles", "final"
+  ),
+  "final",
+  "."
+)
+
+csv_counts <- vapply(candidate_dirs, function(path) {
+  if (!dir.exists(path)) return(0L)
+  length(list.files(path, pattern = "\\.csv$", full.names = FALSE))
+}, integer(1L))
+
+if (max(csv_counts) == 0L) {
+  stop("No CSV files were found. Add the correct folder to candidate_dirs.")
+}
+
+data_dir <- candidate_dirs[which.max(csv_counts)]
+file_list <- sort(list.files(
+  data_dir,
+  pattern = "\\.csv$",
+  full.names = TRUE
+))
+
+if (length(file_list) != 184L) {
+  warning(
+    "Expected 184 CSV files, but found ", length(file_list),
+    " in: ", normalizePath(data_dir)
+  )
+}
+
+required_columns <- c("dataset", "barcode", "sgRNA", "M", "gene")
+
+# -----------------------------------------------------------------------------
+# 2. Helper functions
+# -----------------------------------------------------------------------------
+fmt_int <- function(x) {
+  format(round(x), big.mark = ",", scientific = FALSE, trim = TRUE)
+}
+
+fmt_dec <- function(x, digits = 2L) {
+  format(round(x, digits), nsmall = digits, big.mark = ",",
+         scientific = FALSE, trim = TRUE)
+}
+
+fmt_pct <- function(x, digits = 1L) {
+  paste0(fmt_dec(x, digits), "%")
+}
+
+mode_value <- function(x) {
+  x <- x[is.finite(x)]
+  values <- unique(x)
+  values[which.max(tabulate(match(x, values)))]
+}
+
+summary_six <- function(x) {
+  x <- x[is.finite(x)]
+  c(
+    Min = min(x),
+    Q1 = as.numeric(quantile(x, 0.25, names = FALSE)),
+    Median = median(x),
+    Mean = mean(x),
+    Q3 = as.numeric(quantile(x, 0.75, names = FALSE)),
+    Max = max(x)
+  )
+}
+
+make_summary_row <- function(label, x) {
+  s <- summary_six(x)
+  data.table(
+    Metric = label,
+    Min = s["Min"],
+    Q1 = s["Q1"],
+    Median = s["Median"],
+    Mean = s["Mean"],
+    Q3 = s["Q3"],
+    Max = s["Max"]
+  )
+}
+
+# Exact empirical quantiles from a frequency table. This avoids storing all M
+# observations from all PDX files in memory at the same time.
+quantile_from_frequency <- function(freq, probs) {
+  freq <- copy(freq)[order(M)]
+  freq[, cumulative_N := cumsum(N)]
+  total_N <- sum(freq$N)
+
+  vapply(probs, function(prob) {
+    position <- max(1, ceiling(prob * total_N))
+    freq$M[which(freq$cumulative_N >= position)[1L]]
+  }, numeric(1L))
+}
+
+# -----------------------------------------------------------------------------
+# 3. File-by-file processing
+# -----------------------------------------------------------------------------
+# Only one full PDX is kept in memory at a time. No sampling reservoir is needed
+# because the requested two-page report contains no plots.
+qc_list <- list()
+frequency_list <- list()
+gene_list <- list()
+target_gene_list <- list()
+sgrna_list <- list()
+schema_issue_list <- list()
+
+qc_index <- 0L
+frequency_index <- 0L
+issue_index <- 0L
+
+for (i in seq_along(file_list)) {
+  current_file <- file_list[i]
+  current_name <- basename(current_file)
+  current_size_mb <- as.numeric(file.info(current_file)$size) / 1024^2
+
+  dt_i <- fread(current_file, showProgress = FALSE)
+  setnames(dt_i, trimws(names(dt_i)))
+
+  missing_columns <- setdiff(required_columns, names(dt_i))
+  if (length(missing_columns) > 0L) {
+    issue_index <- issue_index + 1L
+    schema_issue_list[[issue_index]] <- data.table(
+      file = current_name,
+      issue = paste("Missing columns:", paste(missing_columns, collapse = ", "))
+    )
+    rm(dt_i)
+    next
+  }
+
+  # Standardize types before calculating the QC metrics.
+  dt_i[, `:=`(
+    dataset = trimws(as.character(dataset)),
+    barcode = as.character(barcode),
+    sgRNA = trimws(as.character(sgRNA)),
+    gene = trimws(as.character(gene)),
+    M = suppressWarnings(as.numeric(as.character(M)))
+  )]
+
+  # Counts equal to zero are valid in principle. Only missing, non-finite or
+  # negative counts are classified as invalid.
+  valid_M <- is.finite(dt_i$M) & dt_i$M >= 0
+  if (!any(valid_M)) {
+    issue_index <- issue_index + 1L
+    schema_issue_list[[issue_index]] <- data.table(
+      file = current_name,
+      issue = "No finite non-negative M values"
+    )
+    rm(dt_i)
+    next
+  }
+
+  dataset_values <- unique(dt_i$dataset[!is.na(dt_i$dataset) & dt_i$dataset != ""])
+  pdx_id <- if (length(dataset_values) == 1L) {
+    dataset_values
+  } else {
+    tools::file_path_sans_ext(current_name)
+  }
+
+  control_row <- tolower(dt_i$gene) == "ctl"
+  control_row[is.na(control_row)] <- FALSE
+  M_ok <- dt_i$M[valid_M]
+  missing_or_blank_cells <-
+    sum(is.na(dt_i[, ..required_columns])) +
+    sum(dt_i$dataset == "", na.rm = TRUE) +
+    sum(dt_i$barcode == "", na.rm = TRUE) +
+    sum(dt_i$sgRNA == "", na.rm = TRUE) +
+    sum(dt_i$gene == "", na.rm = TRUE)
+  M_quantiles <- as.numeric(quantile(
+    M_ok,
+    probs = c(0.25, 0.50, 0.90, 0.95, 0.99),
+    names = FALSE,
+    type = 7
+  ))
+
+  qc_index <- qc_index + 1L
+  qc_list[[qc_index]] <- data.table(
+    file = current_name,
+    pdx = as.character(pdx_id),
+    file_mb = current_size_mb,
+    n_dataset_values = length(dataset_values),
+    n_rows = nrow(dt_i),
+    n_valid_M = sum(valid_M),
+    n_missing_or_blank_cells = missing_or_blank_cells,
+    n_invalid_M = sum(!valid_M),
+    n_zero_M = sum(valid_M & dt_i$M == 0),
+    n_exact_duplicate_rows = sum(duplicated(dt_i)),
+    n_barcode_labels = uniqueN(dt_i$barcode, na.rm = TRUE),
+    n_sgRNA = uniqueN(dt_i$sgRNA, na.rm = TRUE),
+    n_genes = uniqueN(dt_i$gene, na.rm = TRUE),
+    n_target_genes = uniqueN(dt_i$gene[!control_row], na.rm = TRUE),
+    n_control_sgRNA = uniqueN(dt_i$sgRNA[control_row], na.rm = TRUE),
+    total_M = sum(M_ok),
+    pct_control_M = if (sum(M_ok) > 0) {
+      100 * sum(dt_i$M[valid_M & control_row]) / sum(M_ok)
+    } else {
+      NA_real_
+    },
+    min_M = min(M_ok),
+    q1_M = M_quantiles[1L],
+    median_M = M_quantiles[2L],
+    mean_M = mean(M_ok),
+    sd_M = if (length(M_ok) > 1L) sd(M_ok) else NA_real_,
+    p90_M = M_quantiles[3L],
+    p95_M = M_quantiles[4L],
+    p99_M = M_quantiles[5L],
+    max_M = max(M_ok),
+    pct_M_equal_1 = 100 * mean(M_ok == 1),
+    mean_median_ratio = if (median(M_ok) > 0) {
+      mean(M_ok) / median(M_ok)
+    } else {
+      NA_real_
+    }
+  )
+
+  frequency_index <- frequency_index + 1L
+  frequency_list[[frequency_index]] <- dt_i[valid_M, .N, by = M]
+  gene_list[[qc_index]] <- unique(dt_i$gene[!is.na(dt_i$gene)])
+  target_gene_list[[qc_index]] <- unique(
+    dt_i$gene[!control_row & !is.na(dt_i$gene)]
+  )
+  sgrna_list[[qc_index]] <- unique(dt_i$sgRNA[!is.na(dt_i$sgRNA)])
+
+  rm(dt_i, M_ok)
+  invisible(gc(verbose = FALSE))
+}
+
+if (length(qc_list) == 0L) {
+  stop("No PDX file could be analysed.")
+}
+
+pdx_qc <- rbindlist(qc_list, use.names = TRUE, fill = TRUE)
+schema_issues <- if (length(schema_issue_list) > 0L) {
+  rbindlist(schema_issue_list, use.names = TRUE, fill = TRUE)
+} else {
+  data.table(file = character(), issue = character())
+}
+
+M_frequency <- rbindlist(frequency_list)[
+  , .(N = sum(as.numeric(N))),
+  by = M
+][order(M)]
+
+all_genes <- sort(unique(unlist(gene_list, use.names = FALSE)))
+all_target_genes <- sort(unique(unlist(target_gene_list, use.names = FALSE)))
+all_sgRNA <- sort(unique(unlist(sgrna_list, use.names = FALSE)))
+
+global_quantiles <- quantile_from_frequency(
+  M_frequency,
+  probs = c(0.25, 0.50, 0.90, 0.95, 0.99)
+)
+
+total_valid_M <- sum(pdx_qc$n_valid_M)
+global_mean_M <- sum(pdx_qc$total_M) / total_valid_M
+global_pct_ones <- 100 * M_frequency[M == 1, sum(N)] / sum(M_frequency$N)
+
+modal_sgRNA <- mode_value(pdx_qc$n_sgRNA)
+modal_genes <- mode_value(pdx_qc$n_genes)
+n_modal_sgRNA <- sum(pdx_qc$n_sgRNA == modal_sgRNA)
+n_modal_genes <- sum(pdx_qc$n_genes == modal_genes)
+
+gene_panel_frequency <- pdx_qc[, .N, by = n_genes][order(-N, -n_genes)]
+gene_panel_text <- paste0(
+  gene_panel_frequency$n_genes,
+  " genes (", gene_panel_frequency$N, " files)",
+  collapse = "; "
+)
+
+# Optional: save the complete one-row-per-PDX QC table for later analyses.
+# fwrite(pdx_qc, "qc_all_pdx.csv")
+```
+
+# 1. Data structure and quality
+
+Each CSV file represents one experimental dataset from a breast-cancer PDX screen. A file is therefore one **PDX dataset**, but not necessarily one independent patient. Within each file, the clone counts (`M`) are recorded for barcodes linked to sgRNAs and genes. This EDA checks whether the files are complete and describes how much they differ. It does not combine all raw counts to calculate gene fitness.
+
+```{r collection-overview, results='asis'}
+collection_overview <- data.table(
+  Metric = c(
+    "CSV files detected",
+    "Dataset files successfully analysed",
+    "Files with an unusable schema",
+    "Total barcode-level observations",
+    "Valid non-negative M observations",
+    "Missing, non-finite or negative M values",
+    "Zero M values",
+    "Missing/blank cells in required columns",
+    "Exact duplicate rows",
+    "Distinct gene labels (including ctl)",
+    "Distinct target genes in the collection",
+    "Distinct sgRNA labels in the collection",
+    "Total CSV size (MB)"
+  ),
+  Value = c(
+    fmt_int(length(file_list)),
+    fmt_int(nrow(pdx_qc)),
+    fmt_int(nrow(schema_issues)),
+    fmt_int(sum(pdx_qc$n_rows)),
+    fmt_int(total_valid_M),
+    fmt_int(sum(pdx_qc$n_invalid_M)),
+    fmt_int(sum(pdx_qc$n_zero_M)),
+    fmt_int(sum(pdx_qc$n_missing_or_blank_cells)),
+    fmt_int(sum(pdx_qc$n_exact_duplicate_rows)),
+    fmt_int(length(all_genes)),
+    fmt_int(length(all_target_genes)),
+    fmt_int(length(all_sgRNA)),
+    fmt_dec(sum(pdx_qc$file_mb), 1L)
+  )
+)
+
+kable(
+  collection_overview,
+  format = "latex",
+  booktabs = TRUE,
+  align = c("l", "r")
+)
+```
+
+The most common design contains `r fmt_int(modal_sgRNA)` sgRNAs and `r fmt_int(modal_genes)` gene labels, including controls. This design is present in `r fmt_int(n_modal_sgRNA)` of the `r fmt_int(nrow(pdx_qc))` files. The other files use a smaller gene panel. The observed panel sizes are: `r gene_panel_text`. `r if (nrow(schema_issues) == 0L) "All analysed files contained the five required columns: dataset, gene, sgRNA, barcode and M." else paste0(nrow(schema_issues), " file(s) could not be analysed because of a column or M-value problem.")`
+
+If a gene is absent from a smaller panel, it means that the gene was not tested in that experiment. It does not mean that its clone count was zero. For this reason, absent genes are not replaced with zero.
+
+**Variation in PDX size and experimental design**
+
+```{r design-variation, results='asis'}
+design_variation <- rbindlist(list(
+  make_summary_row("Observations per PDX", pdx_qc$n_rows),
+  make_summary_row("Barcode labels per PDX", pdx_qc$n_barcode_labels),
+  make_summary_row("Total M per PDX", pdx_qc$total_M),
+  make_summary_row("sgRNAs per PDX", pdx_qc$n_sgRNA),
+  make_summary_row("Gene labels per PDX (including ctl)", pdx_qc$n_genes),
+  make_summary_row("Control M per PDX (%)", pdx_qc$pct_control_M)
+))
+
+kable(
+  design_variation,
+  format = "latex",
+  booktabs = TRUE,
+  digits = 1,
+  format.args = list(big.mark = ",", scientific = FALSE),
+  align = c("l", rep("r", 6L))
+)
+```
+
+The files differ greatly in size. The number of observations ranges from `r fmt_int(min(pdx_qc$n_rows))` to `r fmt_int(max(pdx_qc$n_rows))`, and the number of barcode labels ranges from `r fmt_int(min(pdx_qc$n_barcode_labels))` to `r fmt_int(max(pdx_qc$n_barcode_labels))`. Therefore, the 184 files should not be treated as one single sample. Each PDX dataset provides a different amount of information.
+
+\newpage
+
+# 2. Differences in raw `M` values
+
+**Pooled descriptive distribution of `M` (descriptive only)**
+
+```{r global-M-summary, results='asis'}
+global_M_summary <- data.table(
+  Metric = c(
+    "Sum of M", "Minimum", "Q1", "Median", "Mean", "P90", "P95",
+    "P99", "Maximum", "Observations with M = 1"
+  ),
+  Value = c(
+    fmt_int(sum(pdx_qc$total_M)),
+    fmt_int(min(M_frequency$M)),
+    fmt_dec(global_quantiles[1L], 2L),
+    fmt_dec(global_quantiles[2L], 2L),
+    fmt_dec(global_mean_M, 2L),
+    fmt_dec(global_quantiles[3L], 2L),
+    fmt_dec(global_quantiles[4L], 2L),
+    fmt_dec(global_quantiles[5L], 2L),
+    fmt_int(max(M_frequency$M)),
+    fmt_pct(global_pct_ones, 1L)
+  )
+)
+
+kable(
+  global_M_summary,
+  format = "latex",
+  booktabs = TRUE,
+  align = c("l", "r")
+)
+```
+
+This table only describes the raw counts from all files together. It does not produce fitness values. Most clone counts are very small: `r fmt_pct(global_pct_ones, 1L)` of all observations equal 1, and the median is `r fmt_dec(global_quantiles[2L], 2L)`. However, the mean is `r fmt_dec(global_mean_M, 2L)` and the largest value is `r fmt_int(max(M_frequency$M))`. This means that a small number of very large clones pull the mean upward.
+
+**Variation of the `M` distribution between PDX datasets**
+
+```{r distribution-variation, results='asis'}
+distribution_variation <- rbindlist(list(
+  make_summary_row("Total M", pdx_qc$total_M)[, c("Q1", "Mean", "Q3") := NULL],
+  make_summary_row("Mean M", pdx_qc$mean_M)[, c("Q1", "Mean", "Q3") := NULL],
+  make_summary_row("Median M", pdx_qc$median_M)[, c("Q1", "Mean", "Q3") := NULL],
+  make_summary_row("P99 of M", pdx_qc$p99_M)[, c("Q1", "Mean", "Q3") := NULL],
+  make_summary_row("Maximum M", pdx_qc$max_M)[, c("Q1", "Mean", "Q3") := NULL],
+  make_summary_row("M = 1 (%)", pdx_qc$pct_M_equal_1)[, c("Q1", "Mean", "Q3") := NULL],
+  make_summary_row("Control M (%)", pdx_qc$pct_control_M)[, c("Q1", "Mean", "Q3") := NULL],
+  make_summary_row("Mean/median ratio", pdx_qc$mean_median_ratio)[, c("Q1", "Mean", "Q3") := NULL]
+))
+
+kable(
+  distribution_variation,
+  format = "latex",
+  booktabs = TRUE,
+  digits = 2,
+  format.args = list(big.mark = ",", scientific = FALSE),
+  align = c("l", "r", "r", "r")
+)
+```
+
+The shape of the distribution also changes between files. The mean `M` ranges from `r fmt_dec(min(pdx_qc$mean_M), 2L)` to `r fmt_dec(max(pdx_qc$mean_M), 2L)`, and the largest observed count in a file ranges from `r fmt_int(min(pdx_qc$max_M))` to `r fmt_int(max(pdx_qc$max_M))`. Large clone counts therefore have a much stronger effect in some PDX datasets than in others.
+
+**Conclusions and implications for SRM**
+
+* The mean is higher than the median in all `r fmt_int(nrow(pdx_qc))` analysed files. Therefore, the ordinary mean is influenced by large clone counts in every PDX dataset.
+* The files differ in size, barcode coverage, gene panel, control proportion and extreme values. The raw observations from all files should not be pooled for one SRM estimate.
+* Raw `M` is a clone count, not a fitness value. SRM must first be applied separately to each sgRNA within each PDX dataset.
+* The 70th-percentile reference must then be calculated separately within each PDX, using only the gene-targeting sgRNA estimates. Control guides are excluded. The point estimate and both confidence limits are divided by the same reference.
+* After normalization, the sgRNAs targeting the same gene can be compared. Agreement between the guides gives stronger evidence than one low guide alone.
+* This global EDA shows why a robust method such as SRM is useful, but it does not prove that every sgRNA satisfies all SRM assumptions. These checks must be made at the sgRNA level.
+* This report does not rank genes. The gene interpretation comes only after the sgRNA-level SRM analysis.
