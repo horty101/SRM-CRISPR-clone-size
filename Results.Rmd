@@ -1,0 +1,853 @@
+---
+title: "Results: SRM application to PDX C0331-231"
+subtitle: "Tail diagnostics, selection of p, SRM intervals and comparison with Eirew et al. (2022)"
+author: "Horty Katé"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+    fig_caption: true
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+geometry: margin=0.70in
+fontsize: 10pt
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+---
+
+```{r setup, include=FALSE}
+required_packages <- c("data.table", "ggplot2", "stabledist", "tea", "knitr")
+missing <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) stop("Install required R packages: ", paste(missing, collapse = ", "))
+library(data.table)
+library(ggplot2)
+library(knitr)
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.align = "center", dpi = 140)
+options(knitr.kable.NA = "-")
+show_table <- function(z, title, digits = NULL) {
+  if (nrow(z) == 0L) {
+    cat(paste0("**", title, ":** no rows under the current rules.\n\n"))
+    return(invisible(NULL))
+  }
+
+  # Keep automatic escaping of the data (e.g. AKT2_5), while displaying
+  # mathematical symbols only in headings after knitr has escaped text.
+  math_headings <- c(
+    alpha_hat = "$\\widehat{\\alpha}$",
+    alpha_dAMSE = "$\\widehat{\\alpha}_{\\mathrm{dAMSE}}$",
+    alpha_Hill_reexam = "$\\widehat{\\alpha}_{\\mathrm{Hill,reexam}}$",
+    alpha_L_reexam = "$\\widehat{\\alpha}_{L,\\mathrm{reexam}}$",
+    alpha_L = "$\\widehat{\\alpha}_{L}$",
+    alpha = "$\\widehat{\\alpha}$"
+  )
+  original_cols <- names(z)
+  renamed_cols <- original_cols
+  for (j in seq_along(original_cols)) {
+    if (original_cols[j] %in% names(math_headings))
+      renamed_cols[j] <- paste0("MATHHEADER", j, "END")
+  }
+  args <- list(
+    x = z,
+    col.names = renamed_cols,
+    format = if (knitr::is_latex_output()) "latex" else "pipe",
+    booktabs = TRUE,
+    # kable() leaves LaTeX captions unescaped. Guide names such as AKT2_5
+    # would otherwise trigger "Missing $ inserted" during PDF compilation.
+    caption = if (knitr::is_latex_output())
+      gsub("_", "\\\\_", title) else title,
+    longtable = knitr::is_latex_output() && nrow(z) > 25L,
+    row.names = FALSE
+  )
+  if (!is.null(digits) && length(digits) > 0L) {
+    args$digits <- digits
+  }
+
+  rendered <- as.character(do.call(knitr::kable, args))
+  for (j in seq_along(original_cols)) {
+    if (original_cols[j] %in% names(math_headings)) {
+      placeholder <- paste0("MATHHEADER", j, "END")
+      # strsplit/paste preserves literal LaTeX backslashes in the replacement.
+      rendered <- vapply(strsplit(rendered, placeholder, fixed = TRUE),
+                         paste, collapse = math_headings[[original_cols[j]]],
+                         FUN.VALUE = character(1))
+    }
+  }
+  cat(paste(rendered, collapse = "\n"), "\n\n", sep = "")
+  invisible(NULL)
+}
+fmt_ci <- function(l, u, digits = 3L) {
+  ifelse(is.finite(l) & is.finite(u),
+         sprintf(paste0("[%.", digits, "f, %.", digits, "f]"), l, u), "-")
+}
+```
+
+# Processes: Eirew et al. and the SRM adaptation
+
+```{r workflow, fig.width=6.5, fig.height=6, fig.cap="Comparison of the original approach of Eirew et al. (2022) and the SRM application. The two estimands are not identical."}
+workflow <- rbindlist(list(
+  data.table(x = -1.7, y = 7:1, panel = "Eirew et al. (2022)",
+    label = c("Positive barcode counts + initial reads",
+              "Bayesian hierarchical model / mix-NB",
+              "Extinction and growth model",
+              "Conditional 98% winsorization",
+              "Posterior distribution of mean fitness",
+              "Normalization: 70th percentile of gene-targeting sgRNAs",
+              "95% credible interval")),
+  data.table(x = 1.7, y = 7:1, panel = "SRM application",
+    label = c("Same observed positive counts + initial reads",
+              "dAMSE tail index + Pareto plots",
+              "O'Brien + running mean if alpha <= 1",
+              "Candidate selection + lower bound of alpha",
+              "Choose 1 < p < q < lower alpha bound",
+              "SRM 95% CI + positive intersection",
+              "Normalized SRM fitness + Eirew comparison"))
+))
+workflow[, fill := ifelse(x < 0, "#DCEAF8", "#DFEEDC")]
+arrows <- workflow[y > 1, .(x, y = y - .34, yend = y - .66)]
+ggplot() +
+  geom_segment(data = arrows, aes(x = x, xend = x, y = y, yend = yend),
+               arrow = grid::arrow(length = grid::unit(0.10, "inches"))) +
+  geom_label(data = workflow, aes(x = x, y = y, label = label, fill = fill),
+             size = 2.4, label.size = .25, label.padding = grid::unit(.18,"lines")) +
+  annotate("text", x = c(-1.7, 1.7), y = 7.65,
+           label = c("Eirew et al. (2022)", "SRM adaptation"),
+           fontface = "bold", size = 4) +
+  annotate("text", x = 0, y = .12,
+           label = "I_t is an initial read count, not the number of initial clones. No artificial zeros.",
+           size = 2.65, colour = "firebrick") +
+  scale_fill_identity() + coord_cartesian(xlim = c(-3.7,3.7), ylim = c(-.1,7.95), clip = "off") +
+  theme_void() -> p_workflow
+dir.create("figures_thesis", showWarnings = FALSE)
+ggsave(file.path("figures_thesis", "ch4_workflow_comparison.pdf"), p_workflow,
+       width = 6.5, height = 6)
+p_workflow
+```
+
+Only gene-targeting sgRNAs are analysed. Control sgRNAs are excluded before
+estimating the tail index or running O'Brien, Hill and SRM. The observed clone
+size is denoted by $M$; $S_t$ remains the number of positive barcodes and
+is retained in the normalization formula because $S_t$ and $M$ are different quantities.
+
+The **SRM target** for sgRNA $t$ is the conditional mean $\mu_t^+=E[M_t\mid M_t>0]$ of the *unwinsorized* positive counts. Eirew et al. model a **winsorized** mean cellular output (also accounting for unobserved extinction) and report its normalized posterior median and 95% credible interval. Therefore the final fitness comparison is **descriptive** rather than an equivalence of estimands or an accuracy comparison.
+
+# Configuration and observed data
+
+```{r configuration, include=FALSE}
+target_tumour <- "C0331-231"
+input_candidates <- list(
+  final = c("C0331-231(1)(1).csv", "C0331-231.csv", "C0331_231.csv"),
+  initial = c("signaling1.csv", "signaling1(1).csv"),
+  map = c("signaling1_guides.csv"),
+  paper = c("41467_2022_31830_MOESM3_ESM.csv",
+            "41467_2022_31830_MOESM3_ESM(1).csv",
+            "41467_2022_31830_MOESM3_ESM(2).csv")
+)
+search_dirs <- c(".", "inputs/Bachelorarbeit", "upload")
+find_input <- function(names, label) {
+  paths <- unlist(lapply(search_dirs, function(d) file.path(d, names)), use.names = FALSE)
+  present <- paths[file.exists(paths)]
+  if (!length(present)) stop("Missing ", label, ". Place one of these files in the knitting directory: ",
+                              paste(names, collapse=", "))
+  present[1L]
+}
+final_file <- find_input(input_candidates$final, "positive final counts")
+initial_file <- find_input(input_candidates$initial, "initial read counts")
+map_file <- find_input(input_candidates$map, "sgRNA-name map")
+paper_file <- find_input(input_candidates$paper, "published Eirew estimates")
+results_dir <- "C0331_231_SRM_revised_results"
+dir.create(results_dir, showWarnings=FALSE, recursive=TRUE)
+per_guide_dir <- file.path(results_dir, "per_sgRNA_tables")
+dir.create(per_guide_dir, showWarnings=FALSE, recursive=TRUE)
+# These files contain the supervisor-provided numerical functions, with the
+# self-running synthetic demonstrations removed from the O'Brien script.
+if(!file.exists("srm_ci.R") || !file.exists("obrien_test_and_plots.R"))
+  stop("Place srm_ci.R and obrien_test_and_plots.R in the same directory as the main Rmd.")
+source("srm_ci.R", local=TRUE)
+source("obrien_test_and_plots.R", local=TRUE)
+
+
+# Diagnostics. Exploratory cutoffs are transparent operational rules, not proofs.
+obrien_permutations <- 40L
+obrien_curve_points <- 60L
+obrien_slope_cutoff <- -0.10   # supervisor's heuristic: < -0.1 is clearly decreasing
+minimum_tail_n <- 50L
+minimum_distinct <- 5L
+
+# p rule from the supervisor's note: approximate one-sided 95% Hill bound.
+alpha_z <- 1.645
+# Fixed grid: increments of 0.05, starting at 1.05. No off-grid fallback.
+p_candidates <- round(seq(1.05, 1.95, by = 0.05), 2)
+include_exploratory_refits <- TRUE  # exploratory only; not validated for nominal coverage
+
+# SRM numerical parameters: defaults from the supervisor srm_ci.R (not legacy Y).
+q_prime <- 1
+n0 <- 9L
+r_lower <- 5L
+r_upper <- 5L
+stable_beta <- 0.5
+stable_gamma <- 1
+stable_delta <- 0
+stable_pm <- 0
+stable_window <- c(.7, 1.3)
+max_stable_draws <- 1000L
+base_seed <- 1244L
+```
+
+```{r import-and-check, include=FALSE}
+raw <- fread(final_file)
+stopifnot(all(c("dataset","barcode","sgRNA","M","gene") %in% names(raw)))
+raw[, `:=`(dataset=trimws(as.character(dataset)),
+           barcode=trimws(as.character(barcode)),
+           sgRNA_index=as.integer(sgRNA),
+           M=as.numeric(M), gene_final=trimws(as.character(gene)))]
+raw <- raw[dataset == target_tumour]
+if (!nrow(raw)) stop("Tumour not found in final counts: ", target_tumour)
+# The analysis only concerns gene-targeting guides: exclude all controls
+# BEFORE dAMSE, O'Brien, Hill profiles, p selection and SRM.
+raw <- raw[tolower(gene_final) != "ctl"]
+if (!nrow(raw)) stop("No gene-targeting guides remain after excluding controls.")
+if (anyNA(raw[, .(barcode,sgRNA_index,M,gene_final)]) || any(!is.finite(raw$M)) ||
+    any(raw$M<=0)) stop("Final data must have finite positive M and valid IDs.")
+if (raw[, anyDuplicated(.SD), .SDcols=c("sgRNA_index","barcode")] > 0L)
+  stop("Duplicate sgRNA-barcode pairs: first aggregate genuine duplicates correctly.")
+
+map0 <- fread(map_file)
+stopifnot(all(c("sgRNA","name","gene") %in% names(map0)))
+map <- map0[, .(sgRNA_index=as.integer(sgRNA),
+                sgRNA_official=trimws(as.character(name)),
+                gene_map=trimws(as.character(gene)))]
+if (anyNA(map) || anyDuplicated(map$sgRNA_index) || anyDuplicated(map$sgRNA_official))
+  stop("Guide map has missing / duplicated IDs.")
+initial0 <- fread(initial_file)
+stopifnot(all(c("sgRNA","gene","counts") %in% names(initial0)))
+initial <- initial0[, .(sgRNA_index=as.integer(sgRNA),
+                        gene_initial=trimws(as.character(gene)), J_t=as.numeric(counts))]
+if (anyNA(initial) || anyDuplicated(initial$sgRNA_index) || any(initial$J_t<=0))
+  stop("Initial counts are invalid.")
+raw <- merge(raw, map, by="sgRNA_index", all.x=TRUE, sort=FALSE)
+if (anyNA(raw$sgRNA_official) || any(raw$gene_map != raw$gene_final))
+  stop("Unmapped/mismatched guide names or gene labels.")
+summary <- raw[, .(S_t=.N, sum_M=sum(M), mean_positive=mean(M),
+                   median_M=median(M), maximum_M=max(M),
+                   n_distinct=uniqueN(M)),
+               by=.(sgRNA_index,sgRNA_official,gene=gene_map)]
+summary <- merge(summary, initial, by="sgRNA_index", all.x=TRUE, sort=FALSE)
+if (anyNA(summary$J_t) || any(summary$gene!=summary$gene_initial))
+  stop("Initial read counts and genes do not match all final guides.")
+if (any(tolower(summary$gene) == "ctl"))
+  stop("Control sgRNAs unexpectedly entered the statistical analysis.")
+summary[, guide_type := "gene-targeting"]
+summary[, output_per_initial_read := mean_positive*S_t/J_t]
+setorder(raw,sgRNA_index,barcode)
+setorder(summary,sgRNA_index)
+```
+
+```{r data-summary, results='asis'}
+show_table(data.table(
+  Quantity=c("Total observed clones", "Gene-targeting sgRNAs", "Target genes",
+             "Minimum observations per sgRNA", "Maximum observations per sgRNA"),
+  Value=c(nrow(raw), nrow(summary), uniqueN(summary$gene),
+          min(summary$S_t), max(summary$S_t))),
+  "Data and sample size for the chosen PDX (controls excluded)")
+```
+
+# Step 1 -- dAMSE estimates of $\alpha$
+
+```{r tail-estimation, include=FALSE}
+damse_one <- function(x) {
+  empty <- list(tail_status="failed", alpha_damse=NA_real_, k_damse=NA_integer_,
+                threshold_damse=NA_real_)
+  if (length(x)<minimum_tail_n || uniqueN(x)<minimum_distinct) {
+    empty$tail_status <- "insufficient_data"; return(empty)
+  }
+  fit <- tryCatch(suppressWarnings(tea::dAMSE(x)), error=function(e) NULL)
+  if (is.null(fit)) return(empty)
+  a <- as.numeric(fit$tail.index)[1L]
+  k <- as.integer(fit$k0)[1L]
+  threshold <- as.numeric(fit$threshold)[1L]
+  if (length(a)!=1 || !is.finite(a) || a<=0 || length(k)!=1 || is.na(k) ||
+      k<2 || k>=length(x) || length(threshold)!=1 ||
+      !is.finite(threshold) || threshold<=0) return(empty)
+  list(tail_status="ok",alpha_damse=a,k_damse=k,threshold_damse=threshold)
+}
+tail <- rbindlist(lapply(seq_len(nrow(summary)), function(i) {
+  g <- summary$sgRNA_index[i]
+  z <- damse_one(raw[sgRNA_index==g,M])
+  data.table(sgRNA_index=g, tail_status=z$tail_status,
+             alpha_damse=z$alpha_damse,k_damse=z$k_damse,
+             threshold_damse=z$threshold_damse)
+}))
+summary <- merge(summary,tail,by="sgRNA_index",all.x=TRUE,sort=FALSE)
+summary[, damse_candidate := tail_status=="ok" & alpha_damse>1]
+summary[, alpha_lower_damse := fifelse(damse_candidate,
+  alpha_damse-alpha_z*alpha_damse/sqrt(k_damse), NA_real_)]
+fwrite(summary[, .(sgRNA_index,sgRNA_official,gene,S_t,alpha_damse,
+                    k_damse,threshold_damse,alpha_lower_damse,damse_candidate)],
+       file.path(results_dir,"01_all_dAMSE.csv"))
+```
+
+The approximate one-sided 95% lower confidence bound for the upper-tail
+exponent is calculated as
+
+$$
+\widehat{\alpha}_{L,t}
+= \widehat{\alpha}_{t}
+- 1.645\,\frac{\widehat{\alpha}_{t}}{\sqrt{k_t^*}},
+$$
+
+where $\widehat{\alpha}_{t}$ is the dAMSE estimate and $k_t^*$ is its
+selected number of upper-tail observations. We retain in Table 2 **only**
+sgRNAs with $\widehat{\alpha}_{L,t}>1$. The SRM construction for the mean
+requires a moment order satisfying $1<p<q<\alpha_t$. If the estimated lower
+bound is at most 1, no $p>1$ satisfies our conservative selection rule.
+This lower bound is an **approximate Hill-type screening criterion**, not
+proof that the mean exists or a confidence bound with guaranteed 95% coverage
+after dAMSE's data-driven choice of $k_t^*$.
+
+```{r damse-table, results='asis'}
+show_table(summary[
+  damse_candidate == TRUE &
+  is.finite(alpha_lower_damse) & alpha_lower_damse > 1
+][order(-alpha_damse),
+  .(sgRNA=sgRNA_official,
+    alpha_hat=round(alpha_damse,3),
+    alpha_L=round(alpha_lower_damse,3))],
+  "sgRNAs retained by dAMSE with lower tail-index bound above 1")
+```
+
+# Step 2 -- O'Brien for $\widehat{\alpha}_{\mathrm{dAMSE}}\leq 1$, and Hill-plot re-examination
+
+We apply O'Brien **only** when dAMSE gives $\widehat{\alpha}\leq1$ (including the boundary). A decreasing permutation-averaged maximum-to-sum ratio is evidence worth investigating, **not proof** that a moment exists. A flat curve does **not prove** that the mean is infinite. All Pareto, O'Brien, Hill and running-mean plots are kept in the separate diagnostic appendix.
+
+```{r obrien-and-hill-functions, include=FALSE}
+# Supervisor's method: regression of the mean of LOG(max/sum) over
+# 40 random permutations and 60 log-spaced prefix sizes, from 50 to n.
+obrien_one <- function(x, seed, B=40L, grid_points=60L) {
+  if(length(x)<50L) return(list(status="unavailable",slope=NA_real_,
+       neg_share=NA_real_,curve=data.table()))
+  set.seed(seed)
+  fit <- tryCatch(obrien_slope(x,n_points=grid_points,n_perm=B),
+                  error=function(e) NULL)
+  if(is.null(fit)) return(list(status="unavailable",slope=NA_real_,
+                              neg_share=NA_real_,curve=data.table()))
+  slope <- as.numeric(fit$slope)
+  status <- if (is.finite(slope) && slope < obrien_slope_cutoff)
+              "decreasing" else "not_clearly_decreasing"
+  # Convert mean log ratio back to a geometric-mean ratio only for plotting.
+  # The classification is calculated on mean(log(M/S)), not on log(mean(M/S)).
+  # The supervisor's original obrien_slope() returns only slope,
+  # avg_logratio and idx. The extended variant also returns logratio_mat
+  # and permutation_slopes. Reconstruct the SAME permutation sample (using
+  # the seed above) when those optional outputs are absent.
+  idx <- as.integer(fit$idx)
+  logmat <- fit$logratio_mat
+  if (!is.matrix(logmat) || ncol(logmat) != length(idx) ||
+      nrow(logmat) < 2L) {
+    set.seed(seed)
+    logmat <- matrix(NA_real_, nrow = B, ncol = length(idx))
+    for (b in seq_len(B)) {
+      xp <- sample(x)
+      cs <- cumsum(abs(xp))
+      cm <- cummax(abs(xp))
+      logmat[b, ] <- log(cm[idx] / cs[idx])
+    }
+  }
+  # Match the original definition: average log ratio before exponentiating.
+  ratio_geo <- exp(colMeans(logmat))
+  ratio_q10 <- exp(apply(logmat, 2L, quantile, probs = .10, na.rm = TRUE))
+  ratio_q90 <- exp(apply(logmat, 2L, quantile, probs = .90, na.rm = TRUE))
+  individual_slopes <- fit$permutation_slopes
+  if (is.null(individual_slopes) ||
+      length(individual_slopes) != nrow(logmat)) {
+    individual_slopes <- apply(logmat, 1L, function(y) {
+      unname(coef(lm(y ~ log(idx)))[2L])
+    })
+  }
+  set.seed(seed+5479L)
+  mn <- matrix(NA_real_, nrow=B,ncol=length(fit$idx))
+  for(i in seq_len(B)) {
+    y <- sample(x,length(x),replace=FALSE)
+    mn[i,] <- cumsum(y)[fit$idx]/fit$idx
+  }
+  list(status=status,slope=slope,
+       neg_share=mean(individual_slopes < 0, na.rm=TRUE),
+       curve=data.table(k=idx, ratio_mean=ratio_geo,
+          ratio_q10=ratio_q10, ratio_q90=ratio_q90,
+          running_mean=colMeans(mn),
+          running_q10=apply(mn,2,quantile,probs=.10,na.rm=TRUE),
+          running_q90=apply(mn,2,quantile,probs=.90,na.rm=TRUE)))
+}
+
+hill_profile_one <- function(x) {
+  n <- length(x)
+  z <- sort(x,decreasing=TRUE)
+  k_max <- min(n-1L, floor(.35*n))
+  if (k_max<25L) return(data.table())
+  kvals <- seq.int(15L,k_max)
+  cslog <- cumsum(log(z))
+  gamma <- (cslog[kvals]/kvals)-log(z[kvals+1L])
+  data.table(k=kvals,threshold=z[kvals+1L],
+             hill_alpha=ifelse(gamma>0,1/gamma,NA_real_))
+}
+
+# Objective *exploratory* stability choice, not an estimator with established
+# post-selection coverage: do NOT choose k on the basis of alpha crossing 1.
+hill_stability_refit <- function(profile) {
+  valid <- copy(profile[is.finite(hill_alpha) & hill_alpha>0])
+  if (nrow(valid)<11L) return(list(k=NA_integer_,alpha=NA_real_,score=NA_real_))
+  width <- 11L
+  candidates <- rbindlist(lapply(seq_len(nrow(valid)-width+1L),function(j) {
+    win <- valid[j:(j+width-1L)]
+    data.table(k=win$k[ceiling(width/2)],
+      alpha=median(win$hill_alpha),
+      score=sd(log(win$hill_alpha))+.1/sqrt(median(win$k)))
+  }))
+  best <- candidates[which.min(score)]
+  list(k=as.integer(best$k),alpha=as.numeric(best$alpha),score=as.numeric(best$score))
+}
+```
+
+```{r run-obrien-refit, include=FALSE}
+obrien_ids <- summary[tail_status=="ok" & alpha_damse<=1,sgRNA_index]
+obrien_items <- lapply(obrien_ids,function(id) {
+  x <- raw[sgRNA_index==id,M]
+  fit <- obrien_one(x,seed=base_seed+id,B=obrien_permutations,
+                    grid_points=obrien_curve_points)
+  pf <- hill_profile_one(x)
+  h <- if (fit$status=="decreasing") hill_stability_refit(pf) else
+    list(k=NA_integer_,alpha=NA_real_,score=NA_real_)
+  list(result=data.table(sgRNA_index=id,obrien_status=fit$status,
+                         obrien_slope=fit$slope,obrien_negative_fraction=fit$neg_share,
+                         hill_refit_alpha=h$alpha,hill_refit_k=h$k,
+                         hill_refit_score=h$score),
+       curve=fit$curve, hill=pf)
+})
+obrien_table <- if (length(obrien_items)) rbindlist(lapply(obrien_items, `[[`,"result")) else
+  data.table(sgRNA_index=integer(),obrien_status=character(),obrien_slope=numeric(),
+             obrien_negative_fraction=numeric(),hill_refit_alpha=numeric(),
+             hill_refit_k=integer(),hill_refit_score=numeric())
+obrien_curves <- if(length(obrien_items)) rbindlist(lapply(seq_along(obrien_items),function(i) {
+  c0 <- copy(obrien_items[[i]]$curve)
+  if(!nrow(c0)) return(NULL)
+  c0[,sgRNA_index:=obrien_ids[i]];c0
+}),fill=TRUE) else data.table()
+hill_profiles <- if(length(obrien_items)) rbindlist(lapply(seq_along(obrien_items),function(i) {
+  c0 <- copy(obrien_items[[i]]$hill)
+  if(!nrow(c0)) return(NULL)
+  c0[,sgRNA_index:=obrien_ids[i]];c0
+}),fill=TRUE) else data.table()
+summary <- merge(summary,obrien_table,by="sgRNA_index",all.x=TRUE,sort=FALSE)
+summary[, `:=`(hill_refit_lower = fifelse(is.finite(hill_refit_alpha) &
+                     is.finite(hill_refit_k) & hill_refit_k>1,
+             hill_refit_alpha-alpha_z*hill_refit_alpha/sqrt(hill_refit_k),NA_real_),
+  selection_class=fcase(damse_candidate==TRUE,"dAMSE_primary",
+    obrien_status=="decreasing","OBrien_conflict_reexamine",
+    default="not_selected"))]
+setorder(summary,sgRNA_index)
+fwrite(summary, file.path(results_dir,"02_all_diagnostics_and_selection.csv"))
+```
+
+```{r combined-selection-tables, results='asis'}
+show_table(summary[
+    selection_class=="OBrien_conflict_reexamine" &
+    is.finite(hill_refit_lower) & hill_refit_lower>1
+  ][order(-hill_refit_lower),
+    .(sgRNA=sgRNA_official,
+      alpha_dAMSE=round(alpha_damse,3),
+      OBrien=obrien_status,
+      alpha_Hill_reexam=round(hill_refit_alpha,3),
+      alpha_L_reexam=round(hill_refit_lower,3))],
+  "Additional O'Brien/Hill candidates with a re-examined lower bound above 1")
+```
+
+For discordant sgRNAs, the Hill stability re-estimation is *exploratory*. Its bound reuses an idealized Hill standard error after data-driven selection of $k$ and cannot be treated as a validated 95% lower confidence bound. We label any corresponding SRM intervals **exploratory nominal intervals**, never confirmed 95% confidence intervals.
+
+# Step 3 -- Choose $p$ using the lower bound for $\alpha$
+
+The proposed bound, adapted from the supervisor's working note, is
+
+$$\widehat{\alpha}_{L,t}=\widehat{\alpha}_t-1.645\,\widehat{\alpha}_t/\sqrt{k_t^*}.$$
+
+It is a one-sided normal/Hill approximation, **not** an exact guarantee and **not** an automatically calibrated dAMSE interval. For the primary analysis, retain $1<p<q<\widehat{\alpha}_{L,t}$, where $q=(p+\widehat{\alpha}_{L,t})/2$. The tested values of $p$ follow a fixed grid from 1.05 to 1.95 with increments of 0.05. An sgRNA is excluded from the SRM calculations if **no grid value** satisfies the condition; we do not manufacture an off-grid fallback near 1. In particular, a lower bound at or below 1.05 yields no value of $p$ on the chosen grid.
+
+```{r p-grid, include=FALSE}
+selection <- rbindlist(list(
+  summary[damse_candidate==TRUE &
+          is.finite(alpha_lower_damse) & alpha_lower_damse>1,
+    .(sgRNA_index,sgRNA_official,gene,source="primary_dAMSE",
+      alpha_for_p=alpha_damse,k_for_p=k_damse,alpha_lower=alpha_lower_damse)],
+  summary[selection_class=="OBrien_conflict_reexamine" &
+            is.finite(hill_refit_lower) & hill_refit_lower>1 &
+            include_exploratory_refits==TRUE,
+    .(sgRNA_index,sgRNA_official,gene,source="exploratory_OBrien_Hill",
+      alpha_for_p=hill_refit_alpha,k_for_p=hill_refit_k,
+      alpha_lower=hill_refit_lower)]
+),fill=TRUE)
+
+make_p_grid <- function(one) {
+  a <- one$alpha_lower
+  if(!is.finite(a) || a<=1) return(NULL)
+  possible <- p_candidates[p_candidates>1 & p_candidates<2 & p_candidates<a]
+  # Stay on the requested fixed 0.05 grid even for borderline alpha_L.
+  if (!length(possible)) return(NULL)
+  qval <- (possible+a)/2
+  z <- data.table(sgRNA_index=one$sgRNA_index,
+    sgRNA_official=one$sgRNA_official,gene=one$gene,
+    source=one$source,alpha_for_p=one$alpha_for_p,
+    k_for_p=one$k_for_p,alpha_lower=a,p=possible,q=qval)
+  z[1<p & p<2 & p<q & q<a]
+}
+pq_grid <- if(nrow(selection)) rbindlist(lapply(seq_len(nrow(selection)),
+  function(i) make_p_grid(selection[i])),fill=TRUE) else data.table()
+if(nrow(pq_grid)) setorder(pq_grid,sgRNA_official,p)
+fwrite(if(nrow(selection)) selection else data.table(),
+       file.path(results_dir,"03_tail_bounds_all_candidates.csv"))
+fwrite(pq_grid,file.path(results_dir,"04_p_q_pairs.csv"))
+```
+
+```{r p-tables, results='asis'}
+show_table(if(nrow(selection)) selection[order(sgRNA_official),
+  .(sgRNA=sgRNA_official,Source=source,
+    alpha=round(alpha_for_p,3),
+    alpha_L=round(alpha_lower,3))] else data.table(),
+  "Tail-index lower bound for all retained diagnostic candidates")
+show_table(if(nrow(pq_grid)) pq_grid[,.(sgRNA=sgRNA_official,Source=source,
+  alpha_L=round(alpha_lower,3),p=round(p,3))] else data.table(),
+  "All admissible p values by sgRNA (0.05 increments)")
+n_p <- function(src) if (nrow(pq_grid)) uniqueN(pq_grid[source == src, sgRNA_index]) else 0L
+n_pairs <- function(src) if (nrow(pq_grid)) nrow(pq_grid[source == src]) else 0L
+selection_flow <- data.table(
+  Step = c("Gene-targeting sgRNAs analysed",
+           "  dAMSE estimate above one",
+           "    of which lower bound above one (primary)",
+           "  dAMSE estimate at most one",
+           "    of which decreasing O'Brien ratio (discordant)",
+           "      of which re-examined Hill lower bound above one",
+           "      of which at least one admissible p (exploratory)",
+           "sgRNAs with at least one admissible p",
+           "  primary",
+           "  exploratory",
+           "sgRNA-p pairs",
+           "  primary",
+           "  exploratory"),
+  Number = c(nrow(summary),
+             sum(summary$damse_candidate, na.rm = TRUE),
+             sum(summary$alpha_lower_damse > 1, na.rm = TRUE),
+             sum(summary$tail_status == "ok" & summary$alpha_damse <= 1, na.rm = TRUE),
+             sum(summary$selection_class == "OBrien_conflict_reexamine"),
+             sum(summary$selection_class == "OBrien_conflict_reexamine" &
+                   summary$hill_refit_lower > 1, na.rm = TRUE),
+             n_p("exploratory_OBrien_Hill"),
+             n_p("primary_dAMSE") + n_p("exploratory_OBrien_Hill"),
+             n_p("primary_dAMSE"), n_p("exploratory_OBrien_Hill"),
+             nrow(pq_grid), n_pairs("primary_dAMSE"), n_pairs("exploratory_OBrien_Hill")))
+fwrite(selection_flow, file.path(results_dir, "04b_selection_flow.csv"))
+show_table(selection_flow, "Selection of the sgRNAs and of the admissible values of p")
+```
+
+# Step 4 -- Compute SRM intervals for each p
+
+Only successful numerical intervals appear in the printed $p$-tables.
+Failed runs remain recorded in the exported CSV for reproducibility.
+
+We now **call the supervisor's `srm_ci.R` directly**. Its stable random
+variables use `beta=0.5, gamma=1, delta=0, pm=0`, unlike the previous
+working implementation (`beta=0, gamma=0.5, delta=1, pm=0`). This can change
+the intervals substantially. For each admissible $(p,q)$, the auxiliary
+$q$ is a **moment-existence constraint**; `srm_ci()` itself takes only $p$
+and the moment order `qprime=1`. The code records both the raw interval and
+its intersection with $[0,\infty)$.
+
+```{r srm-functions, include=FALSE}
+srm_one <- function(x,p,q,seed,alpha_bound) {
+  if(!is.finite(p) || !is.finite(q) || !is.finite(alpha_bound) ||
+     !(1<p && p<2 && p<q && q<alpha_bound))
+    stop("Require 1 < p < 2 and p < q < alpha_lower.")
+  f <- srm_ci(x, p=p, qprime=q_prime, alpha=.05,
+              rl=r_lower,ru=r_upper,n0=n0,
+              y_beta=stable_beta,y_gamma=stable_gamma,
+              y_delta=stable_delta,y_pm=stable_pm,
+              ybar_range=stable_window,max_tries=max_stable_draws,
+              seed=seed)
+  # The supervisor's original srm_ci.R returns estimate, L, U, Ybar,
+  # and ci, but does NOT return 'centre' or 'y_draws'.  Do not use
+  # f$centre directly: NULL is silently dropped as a data.table column.
+  # Reconstruct the exact resampling centre from either CI endpoint:
+  # ci_lower = centre - rate*U, ci_upper = centre - rate*L,
+  # with rate = n^(1/p-1)/Ybar.  This is algebra, not a new estimator.
+  needed <- c("ci", "L", "U", "Ybar")
+  if (!all(needed %in% names(f)))
+    stop("srm_ci.R is missing required outputs: ",
+         paste(setdiff(needed, names(f)), collapse=", "))
+  L <- unname(f$ci["lower"])
+  U <- unname(f$ci["upper"])
+  if (length(L)!=1L || length(U)!=1L ||
+      !is.finite(L) || !is.finite(U) || L>U ||
+      length(f$Ybar)!=1L || !is.finite(f$Ybar) || f$Ybar==0 ||
+      length(f$L)!=1L || length(f$U)!=1L ||
+      !is.finite(f$L) || !is.finite(f$U))
+    stop("Invalid or missing numerical SRM outputs from srm_ci.R")
+  rate <- length(x)^(1/p-1) / f$Ybar
+  center_from_lower <- L + rate * f$U
+  center_from_upper <- U + rate * f$L
+  if (!is.finite(center_from_lower) || !is.finite(center_from_upper) ||
+      abs(center_from_lower-center_from_upper) >
+        1e-7 * max(1,abs(center_from_lower),abs(center_from_upper)))
+    stop("SRM centre reconstruction is inconsistent with the two CI endpoints")
+  center <- center_from_lower
+  if (length(f$centre)==1L && is.finite(f$centre)) {
+    if (abs(f$centre-center) > 1e-7*max(1,abs(center)))
+      stop("srm_ci.R centre disagrees with its interval endpoints")
+    center <- as.numeric(f$centre)
+  }
+  draws <- if (length(f$y_draws)==1L && is.finite(f$y_draws))
+              as.integer(f$y_draws) else NA_integer_
+  if(U<0) return(list(status="empty_positive_intersection",
+                    center=center,L_raw=L,U_raw=U,
+                    L=NA_real_,U=NA_real_,width=NA_real_,
+                    Ybar=f$Ybar,draws=draws))
+  Lpos <- max(L,0)
+  list(status="ok",center=center,L_raw=L,U_raw=U,
+       L=Lpos,U=U,width=U-Lpos,Ybar=f$Ybar,draws=draws)
+}
+```
+
+```{r compute-srm, include=FALSE}
+srm <- if(nrow(pq_grid)) rbindlist(lapply(seq_len(nrow(pq_grid)),function(i) {
+  row <- pq_grid[i]
+  x <- raw[sgRNA_index==row$sgRNA_index,M]
+  seed <- base_seed+10000L*row$sgRNA_index+as.integer(round(10000*row$p))
+  tryCatch({
+    f <- srm_one(x,row$p,row$q,seed,row$alpha_lower)
+    data.table(sgRNA_index=row$sgRNA_index,p=row$p,q=row$q,
+      status=f$status,detail=NA_character_,srm_center=f$center,
+      ci_lower_raw=f$L_raw,ci_upper_raw=f$U_raw,
+      ci_lower=f$L,ci_upper=f$U,ci_length=f$width,
+      y_bar=f$Ybar,y_draws=f$draws)
+  },error=function(e) data.table(sgRNA_index=row$sgRNA_index,p=row$p,q=row$q,
+      status="failed",detail=conditionMessage(e),srm_center=NA_real_,
+      ci_lower_raw=NA_real_,ci_upper_raw=NA_real_,
+      ci_lower=NA_real_,ci_upper=NA_real_,ci_length=NA_real_,
+      y_bar=NA_real_,y_draws=NA_integer_))
+}),fill=TRUE) else data.table(sgRNA_index=integer(),p=numeric(),q=numeric(),
+       status=character(),detail=character(),srm_center=numeric(),
+       ci_lower_raw=numeric(),ci_upper_raw=numeric(),ci_lower=numeric(),
+       ci_upper=numeric(),ci_length=numeric(),y_bar=numeric(),y_draws=integer(),
+       sgRNA_official=character(),source=character(),S_t=numeric(),J_t=numeric())
+if(nrow(srm)) {
+  srm <- merge(srm,pq_grid,by=c("sgRNA_index","p","q"),all.x=TRUE,sort=FALSE)
+  srm <- merge(srm,summary[,.(sgRNA_index,S_t,J_t,mean_positive)],
+               by="sgRNA_index",all.x=TRUE,sort=FALSE)
+  setorder(srm,sgRNA_official,p)
+}
+# Fail at the producing step, with helpful diagnostics, not later in a table.
+required_cols <- c("sgRNA_official","p","q","status","srm_center",
+                   "ci_lower","ci_upper","ci_length")
+if (!all(required_cols %in% names(srm)))
+  stop("SRM results have missing columns: ",
+       paste(setdiff(required_cols,names(srm)),collapse=", "),
+       ". Present columns: ",paste(names(srm),collapse=", "))
+fwrite(srm,file.path(results_dir,"05_SRM_all_p_raw_and_positive_CI.csv"))
+```
+
+```{r per-guide-SRM-tables, results='asis'}
+if (!nrow(srm)) {
+  cat("No sgRNA has an admissible p under the lower-bound rule. No SRM interval is claimed.\n\n")
+} else {
+  for (guide in unique(srm[status=="ok",sgRNA_official])) {
+    tab <- srm[sgRNA_official==guide & status=="ok",
+      .(p=round(p,3),q=round(q,3),
+        `SRM interval (positive)`=fmt_ci(ci_lower,ci_upper),
+        CI_length=round(ci_length,3))]
+    show_table(tab,paste("All values of p and SRM intervals for",guide))
+    fwrite(srm[sgRNA_official==guide],
+           file.path(per_guide_dir,paste0(gsub("[^A-Za-z0-9_-]","_",guide),"_SRM.csv")))
+  }
+}
+```
+
+For the exploratory O'Brien/Hill sgRNAs the displayed 95% **nominal** intervals have no demonstrated 95% coverage. The primary dAMSE-derived rows also rely on an approximate Hill-style bound for $\alpha$, not a verified post-selection confidence procedure.
+
+Clipping to nonnegative values preserves **at least** the original coverage for a strictly positive target **if** the original confidence interval itself has valid 95% coverage: $\{\mu\in [L,U]\}=\{\mu\in[L,U]\cap[0,\infty)\}$ for $\mu>0$. It does **not** correct misspecified SRM assumptions, random $p$-selection or plug-in normalization uncertainty.
+
+# Step 5 -- Sensitivity of interval lengths to p
+
+```{r width-curves, fig.width=6.3, fig.height=6, fig.cap="Length of the positive SRM confidence interval against the stability index $p$, for the sgRNAs with at least two admissible values of $p$ (logarithmic scale). Triangles (primary): sgRNAs whose admissible values of $p$ were chosen from the dAMSE estimate of the tail index, with $\\widehat{\\alpha}>1$ and lower bound $\\widehat{\\alpha}_L>1$. Circles (exploratory): sgRNAs with $\\widehat{\\alpha}\\le 1$ under dAMSE, for which the O'Brien diagnostic nevertheless indicated a finite mean; their values of $p$ were chosen from a re-examined Hill estimate with $\\widehat{\\alpha}_L>1$, and their intervals are nominal."}
+fig_dir <- "figures_thesis"
+dir.create(fig_dir, showWarnings = FALSE)
+z  <- srm[status == "ok"]
+multi <- z[, .N, by = sgRNA_official][N >= 2, sgRNA_official]
+zw <- z[sgRNA_official %in% multi]
+lev <- c(sort(unique(zw[source == "primary_dAMSE", sgRNA_official])),
+         sort(unique(zw[source != "primary_dAMSE", sgRNA_official])))
+zw[, sgRNA_official := factor(sgRNA_official, levels = lev)]
+zw[, Selection := fifelse(source == "primary_dAMSE",
+  "Primary: p chosen from the dAMSE estimate (alpha_L > 1)",
+  "Exploratory: alpha <= 1 under dAMSE, finite mean by O'Brien,\np chosen from the re-examined Hill estimate (alpha_L > 1)")]
+p_width <- ggplot(zw, aes(p, ci_length)) +
+  geom_line(colour = "grey50", linewidth = 0.4) +
+  geom_point(aes(shape = Selection), size = 1.6) +
+  scale_y_log10() +
+  scale_x_continuous(breaks = c(1.1, 1.2, 1.3, 1.4)) +
+  facet_wrap(~ sgRNA_official, ncol = 4) +
+  labs(x = "Stability index p", y = "Length of the SRM interval (log scale)",
+       shape = NULL) +
+  guides(shape = guide_legend(ncol = 1)) +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "bottom", legend.justification = "left",
+        legend.text = element_text(size = 8))
+ggsave(file.path(fig_dir, "ch5_interval_length_vs_p.pdf"), p_width,
+       width = 6.3, height = 6)
+p_width
+```
+
+The observed length need not be monotone in $p$, especially with randomized stable draws. The original SRM paper studies the effect of $p$ under its own simulation settings; a comparison is therefore qualitative rather than a predicted monotone law.
+
+# Step 6 -- Scale SRM results and compare fitness with Eirew
+
+As in the supplied code, the fixed empirical reference is
+
+$$c=Q_{0.70}\left\{\overline M_t^+S_t/I_t: t\ \text{targets a gene}\right\},$$
+
+where $I_t$ is the initial read count of sgRNA $t$ (variable `J_t` in the code).
+
+This reference uses **all 168 gene-targeting sgRNAs**, not only the sgRNAs retained for the SRM. We regard $c$ and $S_t/I_t$ as plug-in quantities; their uncertainty is not propagated.
+
+```{r normalize-and-compare, include=FALSE}
+c_ref <- as.numeric(quantile(summary[,output_per_initial_read],
+                             probs=.70,names=FALSE,type=7))
+if(!is.finite(c_ref)||c_ref<=0) stop("Invalid empirical 70th-percentile reference.")
+if(nrow(srm)) srm[,`:=`(
+  fitness_srm=srm_center*(S_t/J_t)/c_ref,
+  fitness_srm_lower=ci_lower*(S_t/J_t)/c_ref,
+  fitness_srm_upper=ci_upper*(S_t/J_t)/c_ref,
+  fitness_srm_length=ci_length*(S_t/J_t)/c_ref)]
+
+published0 <- fread(paper_file)
+stopifnot(all(c("tumour","guide","median","CI95_lo","CI95_hi") %in% names(published0)))
+published <- published0[trimws(as.character(tumour))==target_tumour,
+  .(sgRNA_official=trimws(as.character(guide)),
+    paper_median=as.numeric(median),
+    paper_lower=as.numeric(CI95_lo),paper_upper=as.numeric(CI95_hi))]
+if(!nrow(published)||anyDuplicated(published$sgRNA_official))
+  stop("Missing or duplicate C0331-231 published guide names.")
+if(nrow(srm)) {
+  srm <- merge(srm,published,by="sgRNA_official",all.x=TRUE,sort=FALSE)
+  srm[, paper_overlap := fifelse(status=="ok" &
+    is.finite(paper_lower)&is.finite(paper_upper),
+    pmax(fitness_srm_lower,paper_lower)<=pmin(fitness_srm_upper,paper_upper),NA)]
+  setorder(srm,sgRNA_official,p)
+}
+fwrite(data.table(tumour=target_tumour,reference_c=c_ref,
+   definition="Empirical Q70 of mean(M positive)*S/J among all targeting guides"),
+   file.path(results_dir,"06_normalization_reference.csv"))
+fwrite(srm,file.path(results_dir,"07_fitness_SRM_vs_Eirew_all_p.csv"))
+state <- list(raw=raw,guide_summary=summary,obrien_curves=obrien_curves,
+              hill_profiles=hill_profiles,srm=srm,normalizer=c_ref,
+              params=list(obrien_slope_cutoff=obrien_slope_cutoff,
+                          obrien_permutations=obrien_permutations))
+saveRDS(state,file.path(results_dir,"diagnostic_state.rds"))
+```
+
+```{r fitness-table, results='asis'}
+cat(sprintf("Normalization factor c (empirical, targeting guides): **%.6f**.\n\n",c_ref))
+show_table(if(nrow(srm)) srm[status=="ok",.(
+  sgRNA=sgRNA_official,Source=source,p=round(p,3),
+  `SRM 95% CI`=fmt_ci(fitness_srm_lower,fitness_srm_upper),
+  `SRM length`=round(fitness_srm_length,3),
+  `Eirew 95% CrI`=fmt_ci(paper_lower,paper_upper),
+  `Eirew length`=round(paper_upper-paper_lower,3),
+  Overlap=paper_overlap)] else data.table(),
+  "Normalized SRM confidence intervals and published credible intervals of Eirew et al. (2022), for each p")
+```
+
+```{r fitness-interval-graph, fig.width=6.3, fig.height=9, fig.cap="Normalized 95\\% SRM confidence intervals for each admissible value of $p$ (blue), compared with the published 95\\% credible intervals of Eirew et al. (2022) (red band). The first panels (MYC\\_2, MYC\\_3) are primary sgRNAs, whose values of $p$ come from the dAMSE estimate; the other panels are exploratory sgRNAs, whose values of $p$ come from the re-examined Hill estimate after the O'Brien diagnostic, and their intervals are nominal."}
+fig_dir <- "figures_thesis"
+dir.create(fig_dir, showWarnings = FALSE)
+z <- copy(srm[status == "ok"])
+lev <- c(sort(unique(z[source == "primary_dAMSE", sgRNA_official])),
+         sort(unique(z[source != "primary_dAMSE", sgRNA_official])))
+z[, sgRNA_official := factor(sgRNA_official, levels = lev)]
+
+plot_comparison <- function(z, ncol) {
+  ref <- unique(z[is.finite(paper_lower) & is.finite(paper_upper),
+                  .(sgRNA_official, paper_lower, paper_upper)])
+  ggplot(z, aes(x = p)) +
+    geom_rect(data = ref, inherit.aes = FALSE, alpha = 0.35,
+              aes(xmin = -Inf, xmax = Inf, ymin = paper_lower, ymax = paper_upper,
+                  fill = "Eirew et al. (2022): 95% credible interval")) +
+    geom_errorbar(aes(ymin = fitness_srm_lower, ymax = fitness_srm_upper,
+                      colour = "SRM: 95% confidence interval"),
+                  width = 0.015, linewidth = 0.5) +
+    facet_wrap(~ sgRNA_official, scales = "free_y", ncol = ncol) +
+    scale_fill_manual(NULL,
+      values = c("Eirew et al. (2022): 95% credible interval" = "#E9969A")) +
+    scale_colour_manual(NULL,
+      values = c("SRM: 95% confidence interval" = "#2171B5")) +
+    labs(x = "Stability index p", y = "Normalized fitness") +
+    theme_bw(base_size = 9) +
+    theme(legend.position = "bottom", legend.box = "horizontal",
+          legend.margin = margin(0, 0, 0, 0))
+}
+
+# Main text (Chapter 5): the three primary sgRNAs
+p_primary <- plot_comparison(z[source == "primary_dAMSE"], ncol = 3)
+ggsave(file.path(fig_dir, "ch5_comparison_primary.pdf"), p_primary,
+       width = 6.3, height = 3.4)
+
+# Appendix: all sgRNAs with an admissible p
+p_all <- plot_comparison(z, ncol = 3)
+ggsave(file.path(fig_dir, "ch5_comparison_all.pdf"), p_all,
+       width = 6.3, height = 9)
+p_all
+```
+
+# Summary of the main results
+
+```{r main-results, results='asis'}
+ok <- srm[status == "ok"]
+ok[, width_ratio := fitness_srm_length / (paper_upper - paper_lower)]
+main_results <- data.table(
+  Quantity = c("sgRNA-p pairs with an SRM interval",
+               "Intervals with a strictly positive lower bound",
+               "Intervals overlapping the published credible interval",
+               "Width ratio SRM / published interval: minimum",
+               "Width ratio SRM / published interval: median",
+               "Width ratio SRM / published interval: maximum",
+               "Width ratio, primary sgRNAs only: median"),
+  Value = c(nrow(ok),
+            sum(ok$ci_lower > 0),
+            sum(ok$paper_overlap, na.rm = TRUE),
+            round(min(ok$width_ratio, na.rm = TRUE), 2),
+            round(median(ok$width_ratio, na.rm = TRUE), 2),
+            round(max(ok$width_ratio, na.rm = TRUE), 1),
+            round(median(ok[source == "primary_dAMSE", width_ratio], na.rm = TRUE), 2)))
+fwrite(main_results, file.path(results_dir, "08_main_results.csv"))
+show_table(main_results, "Summary of the SRM intervals and of their comparison with Eirew et al. (2022)")
+
+show_table(ok[source == "primary_dAMSE", .(
+  sgRNA = sgRNA_official, p = round(p, 2),
+  `SRM 95% CI` = fmt_ci(fitness_srm_lower, fitness_srm_upper),
+  `SRM length` = round(fitness_srm_length, 3),
+  `Eirew 95% CrI` = fmt_ci(paper_lower, paper_upper),
+  `Eirew length` = round(paper_upper - paper_lower, 3),
+  `Width ratio` = round(width_ratio, 2))],
+  "Primary sgRNAs: normalized SRM confidence intervals and published credible intervals")
+```
+
+# Interpretation and limitations
+
+**Interpretation boundaries.** (1) O'Brien and Pareto slopes are finite-sample diagnostics, not moment-existence tests with guaranteed decisions. (2) A Hill bound obtained after searching for a stable threshold is exploratory. (3) SRM intervals for such refits are labeled nominal and are not claimed to have established 95% coverage. (4) Intersecting a valid CI with the known nonnegative parameter space does not reduce coverage. (5) The empirical normalizer is treated as fixed. (6) Eirew fits a winsorized Bayesian mean fitness; SRM targets the non-winsorized positive-clone mean, with a plug-in survival/read normalization. The intervals do not automatically target identical estimands.
+
+**Separate appendix:** knit `C0331_231_SRM_diagnostic_appendix.Rmd` *after* knitting this file; it reads `C0331_231_SRM_revised_results/diagnostic_state.rds`.
+
+# References
+
+- Das, A., Denker, M., Levina, A., and Tabacu, L. (2023). *Estimation by stable motions and its applications*. Probability and Mathematical Statistics, 43, 23--39.
+- Eirew, P. et al. (2022). *Accurate determination of CRISPR-mediated gene fitness in transplantable tumours*. Nature Communications, 13, 4534. https://doi.org/10.1038/s41467-022-31830-2.
+- Eirew et al., Supplementary Methods, especially Sections 1.1, 1.3, 1.5, and 1.6.
